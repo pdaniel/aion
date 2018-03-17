@@ -48,72 +48,12 @@ public class AccountTxList<T extends ITransaction> {
      */
     private volatile long lastTouched;
 
-    /**
-     * Represents the earliest point in the list of transactions that contains
-     * a gap, if this is set to -1, it indicates that the whole structure
-     * contains no gaps.
-     *
-     * Specifically, the earliest gap target points to the nonce of the last
-     * transaction that is part the list extending from the first element
-     * known to us.
-     *
-     * For a pending list, this should refer to the latest element in
-     * the list. Note that this is not the size of the list.
-     *
-     * -1 indicates the list is empty
-     */
-    private long earliestGapTarget = -1;
-
     private final boolean sequential;
 
     public AccountTxList(boolean sequential) {
         this.nonceHeap = new PriorityQueue<>(Comparator.comparingLong((t) -> t.nonce));
         this.transactionMap = new HashMap<>();
         this.sequential = sequential;
-    }
-
-    // called when we add a new element
-    private boolean updateGapTarget(TransactionStatus<T> newTx) {
-        // we may hit this case when the array becomes empty
-        // this can occur when we remove all elements or when we
-        // first initialize the array
-        if (this.earliestGapTarget == -1) {
-            this.earliestGapTarget = newTx.nonce;
-            return true;
-        }
-        // this indicates there was previously no gaps
-        long target = earliestGapTarget;
-        if (newTx.nonce <= target && newTx.nonce != (target + 1))
-            return false;
-        this.earliestGapTarget = this.earliestGapTarget + 1;
-        return true;
-    }
-
-    // called when we "update" the map, a possiblity is that the element the gap
-    // targets is deleted (for example when the array becomes empty) and must
-    // be updated to point to the new latest
-    // TODO: logic is faulty atm, needs to be fixed
-    private boolean updateGapTarget() {
-        if (this.nonceHeap.isEmpty() && this.transactionMap.isEmpty()) {
-            this.earliestGapTarget = -1;
-            return true;
-        }
-
-        if (this.transactionMap.get(this.earliestGapTarget) == null) {
-            long earliest = this.nonceHeap.peek().nonce;
-            // we can get away with simply decrementing because we call this update function
-            // everytime we remove an element, therefore assuming all elements up to the gap
-            // are sequential (and adjacent) we can simply decrement
-            if (earliest < this.earliestGapTarget) {
-                this.earliestGapTarget = this.earliestGapTarget - 1;
-                return true;
-            } else {
-                // otherwise the function was an update
-                this.earliestGapTarget = this.nonceHeap.peek().nonce;
-                return true;
-            }
-        }
-        return false;
     }
 
     public synchronized TransactionStatus<T> add(TransactionStatus<T> transaction) {
@@ -144,7 +84,6 @@ public class AccountTxList<T extends ITransaction> {
         // it overrides some previously held nonce
         nonceHeap.add(transaction);
         TransactionStatus<T> old = transactionMap.put(nonce, transaction);
-        updateGapTarget(transaction);
         return old;
     }
 
@@ -169,8 +108,6 @@ public class AccountTxList<T extends ITransaction> {
                 }
             }
         }
-
-        updateGapTarget();
         return true;
     }
 
@@ -220,7 +157,6 @@ public class AccountTxList<T extends ITransaction> {
                     throw new RuntimeException("desync between transactionMap and heap");
             }
         }
-        updateGapTarget();
     }
 
     public synchronized boolean containsNonce(TransactionStatus<T> transaction) {
@@ -249,10 +185,16 @@ public class AccountTxList<T extends ITransaction> {
                 removed.add(tx);
             }
         }
-        updateGapTarget();
         return removed;
     }
 
+    /**
+     * Removes all elements above a certain nonce, used in sequential lists where
+     * we must guarantee there are no gaps in the list
+     *
+     * @param nonce
+     * @return
+     */
     private List<TransactionStatus<T>> removeAboveNonce(final long nonce) {
         List<TransactionStatus<T>> removed = new ArrayList<>();
 
@@ -268,7 +210,14 @@ public class AccountTxList<T extends ITransaction> {
         return removed;
     }
 
-    // TODO: add strict
+
+    /**
+     * Removes elements if they fail the following criteria
+     *
+     * @param balance
+     * @param nrgLimit
+     * @return
+     */
     public synchronized Map.Entry<List<TransactionStatus<T>>, List<TransactionStatus<T>>> removeUpdateState(
             final BigInteger balance,
             final long nrgLimit) {
@@ -293,11 +242,49 @@ public class AccountTxList<T extends ITransaction> {
             invalid = removeAboveNonce(minNonce);
         }
 
-        updateGapTarget();
         return Map.entry(removed, invalid);
     }
 
     public long getLastTouched() {
         return this.lastTouched;
+    }
+
+    /**
+     * Returns the sequential list of blocks and removes them from the list
+     *
+     * @return {@code list} of blocks starting from the given nonce
+     */
+    public synchronized List<TransactionStatus<T>> takeSequential(long nonce) {
+        if (this.nonceHeap.isEmpty() || this.nonceHeap.peek().nonce > nonce)
+            return null;
+
+        List<TransactionStatus<T>> sequential = new ArrayList<>();
+
+        long previousNonce = 0;
+        // initial setup
+        Iterator<TransactionStatus<T>> it = this.nonceHeap.iterator();
+        TransactionStatus<T> firstNext = it.next();
+        previousNonce = firstNext.nonce;
+        sequential.add(firstNext);
+        while (it.hasNext()) {
+            TransactionStatus<T> next = it.next();
+
+            // if we have a gap, break immediately
+            if (next.nonce != previousNonce + 1)
+                break;
+
+            // otherwise its sequential, add to list
+            sequential.add(next);
+
+            // remove from our list
+            it.remove();
+            this.transactionMap.remove(next.nonce);
+            previousNonce++;
+        }
+        return sequential;
+    }
+
+    public synchronized boolean isEmpty() {
+        return this.nonceHeap.isEmpty();
     }
 }

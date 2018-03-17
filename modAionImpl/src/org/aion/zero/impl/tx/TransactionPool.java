@@ -3,13 +3,11 @@ package org.aion.zero.impl.tx;
 import org.aion.base.type.Address;
 import org.aion.base.type.ITransaction;
 import org.aion.base.util.ByteArrayWrapper;
-import org.aion.zero.api.BlockConstants;
 import org.aion.zero.impl.AionBlockchainImpl;
-import org.aion.zero.impl.core.IAionBlockchain;
 import org.aion.zero.impl.db.AionRepositoryImpl;
 
+import java.math.BigInteger;
 import java.util.*;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -17,7 +15,7 @@ import static org.aion.zero.impl.tx.AccountTxList.ERROR_STATUS;
 
 public class TransactionPool<T extends ITransaction> {
 
-    private static enum AddStatus {
+    private enum AddStatus {
         REPLACED,
         ADDED,
         REJECTED
@@ -100,20 +98,28 @@ public class TransactionPool<T extends ITransaction> {
     /**
      * Starts the reaper thread to destroy long-lasting transactions
      */
-    public synchronized void initialize() {
-        reaperExecutor.scheduleAtFixedRate(() -> {
-            cullOldQueuedTransactions(System.currentTimeMillis() - cullDuration);
-        }, 60L, 60L, TimeUnit.SECONDS);
-    }
 
     public synchronized boolean addLocal(final T transaction) {
         TransactionStatus<T> status = new TransactionStatus<>(transaction, false);
-        return add(status) != AddStatus.REJECTED;
+        return addTransaction(status);
     }
 
     public synchronized boolean addRemote(final T transaction) {
         TransactionStatus<T> status = new TransactionStatus<>(transaction, true);
-        return add(status) != AddStatus.REJECTED;
+        return addTransaction(status);
+    }
+
+    private boolean addTransaction(final TransactionStatus<T> status) {
+        AddStatus retStatus = add(status);
+
+        if (retStatus == AddStatus.REJECTED)
+            return false;
+
+        // added new status, changed nonce state need to update
+        if (retStatus == AddStatus.ADDED) {
+            this.moveToPending(false, status);
+        }
+        return true;
     }
 
     /**
@@ -161,7 +167,7 @@ public class TransactionPool<T extends ITransaction> {
 
     private AddStatus addToQueue(final TransactionStatus<T> status) {
         if (!this.queuedPool.containsKey(status.transaction.getFrom())) {
-            this.queuedPool.put(status.transaction.getFrom(), new AccountTxList<>());
+            this.queuedPool.put(status.transaction.getFrom(), new AccountTxList<>(false));
         }
         TransactionStatus<T> out = this.queuedPool.get(status.transaction.getFrom()).add(status);
 
@@ -188,17 +194,21 @@ public class TransactionPool<T extends ITransaction> {
      * @param filter {@code true} if we want to filter based on current state
      *                           {@code false} otherwise
      */
-    private void moveToPending(boolean filter) {
-        Iterator<Map.Entry<Address, AccountTxList<T>>> accIt = this.queuedPool.entrySet().iterator();
-        while(accIt.hasNext()) {
-            Map.Entry<Address, AccountTxList<T>> entry = accIt.next();
-            Address accAddress = entry.getKey();
-            AccountTxList<T> acc = entry.getValue();
+    private void moveToPending(boolean filter, TransactionStatus<T> ...accs) {
+
+        if (accs == null || accs.length == 0) {
+            return;
+        }
+
+        for (int i = 0; i < accs.length; i++) {
+            Address accAddress = accs[i].transaction.getFrom();
+            AccountTxList<T> acc = this.queuedPool.get(accs[i].transaction.getFrom());
 
             if (filter) {
                 long currentNonce = this.repo.getNonce(accAddress).longValueExact();
 
-                // filter nonces in each account
+                // filter nonces in each account, remove transactions that are now
+                // below the current nonce (note that this is the current nonce of the actual state)
                 List<TransactionStatus<T>> removed = acc.removeBelowNonce(currentNonce);
                 for (TransactionStatus<T> r : removed) {
                     this.globalPool.remove(r.hash);
@@ -208,12 +218,63 @@ public class TransactionPool<T extends ITransaction> {
                 // filter un-executable transactions due to balance
                 this.repo.getBalance(accAddress);
 
+                BigInteger currentBalance = this.repo.getBalance(accAddress);
+                Map.Entry<List<TransactionStatus<T>>, List<TransactionStatus<T>>> removedInvalidPair =
+                        acc.removeUpdateState(currentBalance, this.blockEnergyLimit);
+
+                for (TransactionStatus<T> r: removedInvalidPair.getKey()) {
+                    this.globalPool.remove(r.hash);
+                    this.localPool.remove(r.hash);
+                }
+            }
+
+            // move transactions to pending
+            List<TransactionStatus<T>> toPending = acc.takeSequential(getNonce(accAddress));
+            for (TransactionStatus<T> r : toPending) {
+                moveTxToPending(accAddress, r);
+            }
+
+            if (acc.isEmpty()) {
+                // remove key and value from hashmap
+                this.queuedPool.remove(accAddress);
             }
         }
+        // TODO: missing logic related to corner cases related to size
+        // for now we dont have size!
     }
 
-    private void moveToQueue() {
+    // called internally by moveToPending to move a single transaction to pending
+    // the state changes here assume only that scenario
+    private void moveTxToPending(Address addr, TransactionStatus<T> status) {
 
+        // make sure the list exists!
+        AccountTxList<T> acc;
+        if ((acc = this.pendingPool.get(addr)) == null) {
+            acc = new AccountTxList<>(true);
+            this.pendingPool.put(addr, acc);
+        }
+
+        TransactionStatus<T> old = acc.add(status);
+
+        // we failed to insert into the list, so drop this transaction
+        if (old == ERROR_STATUS) {
+            this.globalPool.remove(status.hash);
+            this.localPool.remove(status.hash);
+        }
+
+        // otherwise remove the old transaction that this replaced
+        if (old != null) {
+            this.globalPool.remove(old.hash);
+            this.localPool.remove(old.hash);
+        }
+
+        // TODO: should send an event indicating we added new pending
+    }
+
+    // same thing as {@code moveToPending} but applies for pending transactions
+    // instead
+    private void moveToQueue() {
+        // TODO:
     }
 
     public synchronized long getNonce(final Address address) {
