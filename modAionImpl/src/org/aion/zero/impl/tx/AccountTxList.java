@@ -3,12 +3,20 @@ package org.aion.zero.impl.tx;
 import org.aion.base.type.ITransaction;
 import org.aion.base.util.ByteUtil;
 
+import java.math.BigInteger;
 import java.util.*;
 
 /**
  * Organizes transactions based on optimal price
  */
 public class AccountTxList<T extends ITransaction> {
+
+    /**
+     * Single static instance of transaction status, used to represent
+     * that an error occured in put (was not successful), we may want to formalize
+     * this later but this is an efficient way of representing an error state
+     */
+    public static final TransactionStatus ERROR_STATUS = new TransactionStatus<>();
 
     /**
      * Maintains a set of transactions ordered based on their heap, these transactions
@@ -48,15 +56,31 @@ public class AccountTxList<T extends ITransaction> {
      * Specifically, the earliest gap target points to the nonce of the last
      * transaction that is part the list extending from the first element
      * known to us.
+     *
+     * For a pending list, this should refer to the latest element in
+     * the list. Note that this is not the size of the list.
+     *
+     * -1 indicates the list is empty
      */
-    private long earliestGapTarget;
+    private long earliestGapTarget = -1;
 
-    public AccountTxList() {
+    private final boolean sequential;
+
+    public AccountTxList(boolean sequential) {
         this.nonceHeap = new PriorityQueue<>(Comparator.comparingLong((t) -> t.nonce));
         this.transactionMap = new HashMap<>();
+        this.sequential = sequential;
     }
 
+    // called when we add a new element
     private boolean updateGapTarget(TransactionStatus<T> newTx) {
+        // we may hit this case when the array becomes empty
+        // this can occur when we remove all elements or when we
+        // first initialize the array
+        if (this.earliestGapTarget == -1) {
+            this.earliestGapTarget = newTx.nonce;
+            return true;
+        }
         // this indicates there was previously no gaps
         long target = earliestGapTarget;
         if (newTx.nonce <= target && newTx.nonce != (target + 1))
@@ -65,7 +89,34 @@ public class AccountTxList<T extends ITransaction> {
         return true;
     }
 
-    public synchronized boolean add(TransactionStatus<T> transaction) {
+    // called when we "update" the map, a possiblity is that the element the gap
+    // targets is deleted (for example when the array becomes empty) and must
+    // be updated to point to the new latest
+    // TODO: logic is faulty atm, needs to be fixed
+    private boolean updateGapTarget() {
+        if (this.nonceHeap.isEmpty() && this.transactionMap.isEmpty()) {
+            this.earliestGapTarget = -1;
+            return true;
+        }
+
+        if (this.transactionMap.get(this.earliestGapTarget) == null) {
+            long earliest = this.nonceHeap.peek().nonce;
+            // we can get away with simply decrementing because we call this update function
+            // everytime we remove an element, therefore assuming all elements up to the gap
+            // are sequential (and adjacent) we can simply decrement
+            if (earliest < this.earliestGapTarget) {
+                this.earliestGapTarget = this.earliestGapTarget - 1;
+                return true;
+            } else {
+                // otherwise the function was an update
+                this.earliestGapTarget = this.nonceHeap.peek().nonce;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public synchronized TransactionStatus<T> add(TransactionStatus<T> transaction) {
         Long nonce = transaction.nonce;
 
         TransactionStatus<T> tx;
@@ -73,7 +124,7 @@ public class AccountTxList<T extends ITransaction> {
             // if a transaction with the same nonce arrives, check
             // whether we should update the previous transaction
             if (tx.transaction.getNrgPrice() < transaction.transaction.getNrgPrice()) {
-                return false;
+                return ERROR_STATUS;
             }
 
             // remove the transaction from the nonceHeap and map
@@ -92,8 +143,34 @@ public class AccountTxList<T extends ITransaction> {
         // we definitely want to add this transaction, either its new or
         // it overrides some previously held nonce
         nonceHeap.add(transaction);
-        transactionMap.put(nonce, transaction);
-        updateGapTarget(tx);
+        TransactionStatus<T> old = transactionMap.put(nonce, transaction);
+        updateGapTarget(transaction);
+        return old;
+    }
+
+    public synchronized boolean remove(TransactionStatus<T> transaction) {
+        Long nonce = transaction.nonce;
+
+        if (!this.transactionMap.containsKey(nonce)) {
+            return false;
+        }
+
+        // otherwise remove
+        TransactionStatus<T> status = this.transactionMap.remove(nonce);
+        this.nonceHeap.remove(status);
+
+        if (sequential) {
+            Iterator<TransactionStatus<T>> it = this.nonceHeap.iterator();
+            while (it.hasNext()) {
+                TransactionStatus<T> item = it.next();
+                if (item.nonce > nonce) {
+                    it.remove();
+                    this.transactionMap.remove(item.nonce);
+                }
+            }
+        }
+
+        updateGapTarget();
         return true;
     }
 
@@ -143,6 +220,11 @@ public class AccountTxList<T extends ITransaction> {
                     throw new RuntimeException("desync between transactionMap and heap");
             }
         }
+        updateGapTarget();
+    }
+
+    public synchronized boolean containsNonce(TransactionStatus<T> transaction) {
+        return this.transactionMap.containsKey(transaction.nonce);
     }
 
     /**
@@ -155,6 +237,64 @@ public class AccountTxList<T extends ITransaction> {
         List<TransactionStatus<T>> statuses = new ArrayList<>();
         statuses.addAll(this.nonceHeap);
         return statuses;
+    }
+
+    public synchronized List<TransactionStatus<T>> removeBelowNonce(final long nonce) {
+        List<TransactionStatus<T>> removed = new ArrayList<>();
+        while(!this.nonceHeap.isEmpty()) {
+            TransactionStatus<T> tx = this.nonceHeap.peek();
+            if (tx.nonce < nonce) {
+                this.nonceHeap.remove();
+                this.transactionMap.remove(tx.nonce);
+                removed.add(tx);
+            }
+        }
+        updateGapTarget();
+        return removed;
+    }
+
+    private List<TransactionStatus<T>> removeAboveNonce(final long nonce) {
+        List<TransactionStatus<T>> removed = new ArrayList<>();
+
+        Iterator<TransactionStatus<T>> it = this.nonceHeap.iterator();
+        while(it.hasNext()) {
+            TransactionStatus<T> status = it.next();
+            if (status.nonce > nonce) {
+                it.remove();
+                this.transactionMap.remove(status.nonce);
+                removed.add(status);
+            }
+        }
+        return removed;
+    }
+
+    // TODO: add strict
+    public synchronized Map.Entry<List<TransactionStatus<T>>, List<TransactionStatus<T>>> removeUpdateState(
+            final BigInteger balance,
+            final long nrgLimit) {
+
+        long minNonce = Long.MAX_VALUE;
+        ArrayList<TransactionStatus<T>> removed = new ArrayList<>();
+        for (TransactionStatus<T> status : this.transactionMap.values()) {
+            if (status.reqBalance.compareTo(balance) > 0 ||
+                    status.transaction.getNrg() > nrgLimit) {
+                removed.add(status);
+                // remove from respective maps
+                this.nonceHeap.remove(status);
+                this.transactionMap.remove(status.nonce);
+
+                if (minNonce > status.nonce)
+                    minNonce = status.nonce;
+            }
+        }
+
+        List<TransactionStatus<T>> invalid = Collections.emptyList();
+        if (sequential) {
+            invalid = removeAboveNonce(minNonce);
+        }
+
+        updateGapTarget();
+        return Map.entry(removed, invalid);
     }
 
     public long getLastTouched() {

@@ -3,37 +3,54 @@ package org.aion.zero.impl.tx;
 import org.aion.base.type.Address;
 import org.aion.base.type.ITransaction;
 import org.aion.base.util.ByteArrayWrapper;
+import org.aion.zero.api.BlockConstants;
 import org.aion.zero.impl.AionBlockchainImpl;
 import org.aion.zero.impl.core.IAionBlockchain;
+import org.aion.zero.impl.db.AionRepositoryImpl;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import static org.aion.zero.impl.tx.AccountTxList.ERROR_STATUS;
 
 public class TransactionPool<T extends ITransaction> {
+
+    private static enum AddStatus {
+        REPLACED,
+        ADDED,
+        REJECTED
+    }
+
+    /**
+     * Some VM constants we need to define to correctly pre-calculate some gas
+     * costs, see <a href="https://github.com/aionnetwork/aion_fastvm/wiki/Specifications"></a>
+     * for reference
+     */
+    private static class VMConstant {
+        public final static long txdatazero = 4;
+        public final static long txdatanonzero = 64;
+        public final static long ambientTransaction = 21000;
+    }
 
     /**
      * Represents the list of all transactions currently in the pool
      * (this contains both pending and queued pools)
      */
-    private HashMap<ByteArrayWrapper, T> globalPool = new HashMap<>();
+    private final HashMap<ByteArrayWrapper, TransactionStatus<T>> globalPool = new HashMap<>();
 
     /**
      * Pool for all transactions that are immediately executable,
      * these transactions should not invoke any rejections from
      * the VM
      */
-    private Map<Address, AccountTxList<T>> pendingPool = new HashMap<>();
+    private final Map<Address, AccountTxList<T>> pendingPool = new HashMap<>();
 
     /**
      * Transactions that are not immediately executable
      */
-    private Map<Address, AccountTxList<T>> queuedPool = new HashMap<>();
+    private final Map<Address, AccountTxList<T>> queuedPool = new HashMap<>();
 
     /**
      * From here, we should be able to access all the state that we require, this
@@ -43,22 +60,40 @@ public class TransactionPool<T extends ITransaction> {
     private final AionBlockchainImpl blockchain;
 
     /**
+     * For convenience (and possibly to avoid blockchain swapping repositories on us)
+     * Save a pointer to the root repository
+     */
+    private final AionRepositoryImpl repo;
+
+    /**
      * Pretty much a replacement for nonceManager
      */
-    private Map<Address, Long> nonceMap = new HashMap<>();
+    private final Map<Address, Long> nonceMap = new HashMap<>();
+
+    /**
+     * A map holding elements of the local pool, these are "special" in that
+     * they should get priority, and should be stored and possibly rebroadcasted
+     */
+    private final Map<ByteArrayWrapper, TransactionStatus<T>> localPool = new HashMap<>();
 
     /**
      * Basically determines the lifetime of a transaction, given that they were
      */
-    private long cullDuration;
+    private final long cullDuration;
 
+    /**
+     * Block energy limit, should be updated at each new block
+     */
+    private volatile long blockEnergyLimit;
 
     // Utility classes, not directly tied to the state of the pool
 
     ScheduledExecutorService reaperExecutor = Executors.newSingleThreadScheduledExecutor();
 
-    public TransactionPool(AionBlockchainImpl blockchain, long cullDurationSeconds) {
+    public TransactionPool(final AionBlockchainImpl blockchain,
+                           final long cullDurationSeconds) {
         this.blockchain = blockchain;
+        this.repo = (AionRepositoryImpl) this.blockchain.getRepository();
         this.cullDuration = cullDurationSeconds;
     }
 
@@ -71,14 +106,14 @@ public class TransactionPool<T extends ITransaction> {
         }, 60L, 60L, TimeUnit.SECONDS);
     }
 
-    public synchronized boolean addLocal(T transaction) {
+    public synchronized boolean addLocal(final T transaction) {
         TransactionStatus<T> status = new TransactionStatus<>(transaction, false);
-        return add(status);
+        return add(status) != AddStatus.REJECTED;
     }
 
-    public synchronized boolean addRemote(T transaction) {
+    public synchronized boolean addRemote(final T transaction) {
         TransactionStatus<T> status = new TransactionStatus<>(transaction, true);
-        return add(status);
+        return add(status) != AddStatus.REJECTED;
     }
 
     /**
@@ -87,11 +122,101 @@ public class TransactionPool<T extends ITransaction> {
      * @param status
      * @return
      */
-    private boolean add(TransactionStatus<T> status) {
+    private AddStatus add(final TransactionStatus<T> status) {
+
+        // check if it hits our cache
+        if (this.globalPool.containsKey(status.hash))
+            return AddStatus.REJECTED;
+
+        if (!verifyTransaction(status, this.blockEnergyLimit))
+            return AddStatus.REJECTED;
+
+        AccountTxList<T> acc;
+        // if account is in pending and replaces a transaction, check if its possible to add directly
+        if ((acc = this.pendingPool.get(status.transaction.getFrom())) != null
+                && acc.containsNonce(status)) {
+            // if we tried to insert but failed, then that means the incoming transaction
+            // is underpriced, just abort
+            TransactionStatus<T> old;
+            if ((old = acc.add(status)) == ERROR_STATUS) {
+                return AddStatus.REJECTED;
+            }
+
+            // if local add to local pool
+            this.localPool.put(status.hash, status);
+            // otherwise it was completed successfully, delete the old transaction
+            this.globalPool.remove(old.hash);
+            this.localPool.remove(old.hash);
+            return AddStatus.REPLACED;
+        }
+
+        // otherwise, we'll be inserting the transaction into the queue
+        AddStatus success = addToQueue(status);
+        if (success == AddStatus.ADDED || success == AddStatus.REPLACED) {
+            if (!status.isRemote)
+                this.localPool.put(status.hash, status);
+        }
+        return success;
+    }
+
+    private AddStatus addToQueue(final TransactionStatus<T> status) {
+        if (!this.queuedPool.containsKey(status.transaction.getFrom())) {
+            this.queuedPool.put(status.transaction.getFrom(), new AccountTxList<>());
+        }
+        TransactionStatus<T> out = this.queuedPool.get(status.transaction.getFrom()).add(status);
+
+        // was not inserted, this means that an older transaction had a higher
+        // price than this transaction, which means we should stop trying to insert
+        if (out == ERROR_STATUS) {
+            return AddStatus.REJECTED;
+        }
+
+        if (out != null) {
+            this.globalPool.remove(out.hash);
+            this.localPool.remove(out.hash);
+        }
+
+        // add new entry
+        this.globalPool.put(status.hash, status);
+        return out == null ? AddStatus.ADDED : AddStatus.REPLACED;
+    }
+
+    /**
+     * Validates transactions into the pending pool if possible, at this same time
+     * clear the queue pool of any invalid transactions
+     *
+     * @param filter {@code true} if we want to filter based on current state
+     *                           {@code false} otherwise
+     */
+    private void moveToPending(boolean filter) {
+        Iterator<Map.Entry<Address, AccountTxList<T>>> accIt = this.queuedPool.entrySet().iterator();
+        while(accIt.hasNext()) {
+            Map.Entry<Address, AccountTxList<T>> entry = accIt.next();
+            Address accAddress = entry.getKey();
+            AccountTxList<T> acc = entry.getValue();
+
+            if (filter) {
+                long currentNonce = this.repo.getNonce(accAddress).longValueExact();
+
+                // filter nonces in each account
+                List<TransactionStatus<T>> removed = acc.removeBelowNonce(currentNonce);
+                for (TransactionStatus<T> r : removed) {
+                    this.globalPool.remove(r.hash);
+                    this.localPool.remove(r.hash);
+                }
+
+                // filter un-executable transactions due to balance
+                this.repo.getBalance(accAddress);
+
+            }
+        }
+    }
+
+    private void moveToQueue() {
 
     }
 
-    public synchronized long getNonce(Address address) {
+    public synchronized long getNonce(final Address address) {
         Long nonce;
         // nonceMap is not a cache! its only intended to manage pending nonces
         if ((nonce = this.nonceMap.get(address)) != null)
@@ -105,7 +230,7 @@ public class TransactionPool<T extends ITransaction> {
      *
      * @return {@code amount} of transactions culled
      */
-    private synchronized boolean cullOldQueuedTransactions(long lowerBound) {
+    private synchronized boolean cullOldQueuedTransactions(final long lowerBound) {
         // only reap queue for now, since pending transactions should be
         // processed shortly (atleast thats the assumption)
         Iterator<AccountTxList<T>> it = this.queuedPool.values().iterator();
@@ -120,5 +245,77 @@ public class TransactionPool<T extends ITransaction> {
             }
         }
         return true;
+    }
+
+    private void setBlockEnergyLimit(final long energyLimit) {
+        this.blockEnergyLimit = energyLimit;
+    }
+
+    public static <T extends ITransaction> boolean verifyTransaction(
+            final TransactionStatus<T> txStatus,
+            final long blockEnergyLimit) {
+        final T transaction = txStatus.transaction;
+
+        // structural checks
+        if (    transaction.getHash() == null ||
+                transaction.getNonce() == null ||
+                transaction.getNrgPrice() < 0 ||
+                transaction.getNrg() < 0 ||
+                transaction.getNrgConsume() < 0 ||
+                transaction.getTo() == null ||
+                transaction.getFrom() == null ||
+                transaction.getValue() == null ||
+                transaction.getData() == null)
+            return false;
+
+        // more structural checks
+        if (transaction.getHash().length != 32 ||
+                transaction.getValue().length < 32)
+            return false;
+
+        // simple verification checks
+        // TODO: we dont do size checks yet
+        if (transaction.getNrg() > blockEnergyLimit)
+            return false;
+
+        // TODO: we dont have a minimum gasPrice limit yet
+        // for now just pretend its 1
+        long energyCost = 0;
+        if ((energyCost = calculateGasCost(txStatus)) != -1) {
+            return false;
+        }
+
+        if (txStatus.transaction.getNrg() < energyCost) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     *
+     *
+     * @param txStatus status wrapping a possibly valid transaction
+     * @param <T> extends ITransaction, some transaction
+     * @return {@code amount} representing the minimumGas usage, -1 otherwise to indicate error
+     */
+    public static <T extends ITransaction> long calculateGasCost(final TransactionStatus<T> txStatus) {
+        long gas = VMConstant.ambientTransaction;
+
+        byte[] data;
+        if ((data = txStatus.transaction.getData()).length > 0) {
+            long nonZero = 0;
+            for (int i = 0; i < data.length; i++) {
+                if (data[i] != 0)
+                    nonZero++;
+            }
+
+            // TODO: missing the maximum data check
+            gas += nonZero * VMConstant.txdatanonzero;
+
+            long zero = data.length - nonZero;
+            gas += zero * VMConstant.txdatazero;
+        }
+        return gas;
     }
 }
