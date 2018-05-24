@@ -619,6 +619,23 @@ public class AionBlockchainImpl implements IAionBlockchain {
     }
 
     /**
+     * Creates a new block by giving timeOffset, if you require more context refer to the blockContext creation method,
+     * which allows us to add metadata not usually associated with the block itself.
+     *
+     * @param parent block
+     * @param txs to be added into the block
+     * @param waitUntilBlockTime if we should wait until the specified blockTime before create a new block
+     * @param tsOffset add specific time offset to create a block base on the timestamp of the parent block.
+     * @see #createNewBlock(AionBlock, List, boolean)
+     *
+     * @return new block
+     */
+    public synchronized AionBlock createNewBlock(AionBlock parent, List<AionTransaction> txs, boolean waitUntilBlockTime, long tsOffset) {
+        return createNewBlockInternal(
+            parent, txs, waitUntilBlockTime, max(parent.getTimestamp() + tsOffset, (System.currentTimeMillis() + tsOffset)) / THOUSAND_MS).block;
+    }
+
+    /**
      * Creates a new block, adding in context/metadata about the block
      *
      * @param parent block
@@ -646,7 +663,16 @@ public class AionBlockchainImpl implements IAionBlockchain {
                     break;
                 }
             }
+        } else {
+            while (waitUntilBlockTime && (System.currentTimeMillis() / THOUSAND_MS) <= time) {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
         }
+
         long energyLimit = this.energyLimitStrategy.getEnergyLimit(parent.getHeader());
 
         AionBlock block;
