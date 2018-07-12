@@ -105,15 +105,6 @@ if $guard; then
 		  noInterrupt=false
 		fi
 
-		# Removes remnant processes accessing kernel logfile
-		if $logging; then
-		  temp=$(lsof $file | egrep "java" | cut -c 9-13)
-		  remnants=($tep)
-		  for ((i=0; i<${#remnants[@]}; ++i)); do
-		    kill ${remnants[i]}
-		  done
-		fi
-
 		# Interrupts the watchguard (current process)
 		kill $$
 
